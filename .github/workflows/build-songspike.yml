@@ -1,0 +1,94 @@
+# SongSpike — macOS CI build (the ONLY missing piece for the TestFlight build)
+#
+# WHY THIS EXISTS: the app + ACE-Step/MLX engine cannot finish building on
+# the Linux VM. SwiftBuild (driven by xtool) must compile mlx-swift's
+# .metal shaders with Apple's `metal` tool, which is macOS-only — on Linux
+# the build dies with:
+#     error: unable to spawn process 'metal' (No such file or directory)
+# (The `metal` binary inside the Darwin SDK bundle is a Mach-O arm64
+# executable; it cannot run on the x86_64 Linux VM.) Everything else in
+# the release chain is already done locally: API-reconciled sources,
+# App Store profile "SongSpike App Store", compiled Assets.car.
+#
+# PLACEMENT: put this file at .github/workflows/build-songspike.yml in a
+# repo whose ROOT is the spike-app-build tree (Package.swift, xtool.yml,
+# Sources/, vendor/, Info.plist at the top level), then run it
+# (workflow_dispatch). It produces an UNSIGNED SongSpike.app artifact;
+# signing + upload stay on the local pipeline (prepare_spike.py + zsign
+# + ASC API), exactly like Perotta's org-CI split.
+#
+# NOTE (push restriction): the automation token on the VM has GitHub
+# scopes gist/read:org/repo — GitHub rejects pushes that create workflow
+# files from it ("refusing to allow an OAuth App to create or update
+# workflow ... without workflow scope"), and SSH to GitHub is blocked by
+# the VM proxy. This file therefore has to be added by a human (web UI)
+# or with a workflow-scoped token. That is the single human step left.
+
+name: Build SongSpike (macOS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-26 # pinned; ships Xcode 27 / iOS 27 SDK line
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          swift --version
+
+      - name: Install xtool
+        run: brew install xtool-org/tap/xtool
+
+      - name: Build app (xtool, engine linked, release)
+        env:
+          SONGSPIKE_WITH_ACE: "1"
+        run: |
+          set -euo pipefail
+          xtool dev build -c release
+          ls -la xtool/
+          test -d xtool/SongSpikeApp.app
+
+      - name: Assemble SongSpike.app (executable rename + Info.plist)
+        run: |
+          set -euo pipefail
+          rm -rf SongSpike.app
+          cp -r xtool/SongSpikeApp.app SongSpike.app
+          if [ -f SongSpike.app/SongSpikeApp ]; then
+            mv SongSpike.app/SongSpikeApp SongSpike.app/SongSpike
+            chmod 755 SongSpike.app/SongSpike
+          fi
+          cp Info.plist SongSpike.app/Info.plist
+          # The engine's Metal library must be inside the bundle — MLX
+          # fails at first GPU use without it. Fail loudly if absent.
+          find SongSpike.app -name "*.metallib" -o -name "*Cmlx*.bundle" | grep -q . \
+            || { echo "ERROR: no metallib / Cmlx resource bundle in SongSpike.app"; find SongSpike.app | head -50; exit 1; }
+          ls -la SongSpike.app
+
+      - name: Assert bundle (arm64, bundle ID, engine symbols)
+        run: |
+          set -euo pipefail
+          ARCHS=$(lipo -archs SongSpike.app/SongSpike)
+          echo "Binary archs: $ARCHS"
+          test "$ARCHS" = "arm64"
+          BUNDLE_ID=$(plutil -extract CFBundleIdentifier raw SongSpike.app/Info.plist)
+          echo "Bundle ID: $BUNDLE_ID"
+          test "$BUNDLE_ID" = "com.andrepato.songspike"
+          strings -a SongSpike.app/SongSpike | grep -q "ACEStepPipeline" \
+            || { echo "ERROR: engine symbols missing — engine not linked"; exit 1; }
+          du -sh SongSpike.app
+
+      - name: Upload unsigned .app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SongSpike-app-unsigned
+          path: SongSpike.app
+          retention-days: 30

@@ -74,7 +74,7 @@ jobs:
           if [ -z "$BUNDLE" ]; then
             SONGSPIKE_WITH_ACE=1 swift build --triple arm64-apple-ios26.0 --sdk "$(xcrun --sdk iphoneos --show-sdk-path)" -c release
             BUNDLE=$(find . -name "mlx-swift_Cmlx.bundle" -type d | head -1)
-        fi
+          fi
           test -d "$BUNDLE" || { echo "ERROR: mlx-swift_Cmlx.bundle not found in build products"; exit 1; }
         cp -R "$BUNDLE" SongSpike.app/
           # The engine's Metal library must be inside the bundle — MLX

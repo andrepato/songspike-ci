@@ -92,7 +92,8 @@ jobs:
           BUNDLE_ID=$(plutil -extract CFBundleIdentifier raw SongSpike.app/Info.plist)
           echo "Bundle ID: $BUNDLE_ID"
           test "$BUNDLE_ID" = "com.andrepato.songspike"
-          strings -a SongSpike.app/SongSpike | grep -q "ACEStepPipeline" \
+          strings -a SongSpike.app/SongSpike > /tmp/songspike-strings.txt
+          grep -q "ACEStepPipeline" /tmp/songspike-strings.txt \
             || { echo "ERROR: engine symbols missing — engine not linked"; exit 1; }
           du -sh SongSpike.app
 

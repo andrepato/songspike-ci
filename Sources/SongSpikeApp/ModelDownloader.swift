@@ -110,8 +110,13 @@ struct ModelDownloader: Sendable {
             for file in files {
                 let destination = directory.appendingPathComponent(file)
                 if !fileExistsAndNonEmpty(destination) {
+                    // Snapshot the counters: the progress closure is
+                    // @Sendable and cannot capture the mutable loop vars.
+                    // Both values are stable during one file's download.
+                    let completedSnapshot = completedFiles
+                    let totalSnapshot = totalFiles
                     try await downloadFile(repoID: repo.repoID, file: file, to: destination) { fileFraction in
-                        progress((Double(completedFiles) + fileFraction) / Double(totalFiles))
+                        progress((Double(completedSnapshot) + fileFraction) / Double(totalSnapshot))
                     }
                 }
                 completedFiles += 1

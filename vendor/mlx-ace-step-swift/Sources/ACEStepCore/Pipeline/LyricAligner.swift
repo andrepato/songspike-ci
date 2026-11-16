@@ -125,7 +125,7 @@ public enum LyricAligner {
         for i in 0 ..< ids.count {
             let current = Array(tokenizer.decode(Array(ids[0 ... i])).utf8)
             var text = ""
-            if current.count >= previous.count { text = String(validating: current[previous.count...], as: UTF8.self) ?? "" }
+            if current.count >= previous.count { text = String(bytes: current[previous.count...], encoding: .utf8) ?? "" }
             out.append(text)
             previous = current
         }

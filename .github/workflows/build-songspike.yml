@@ -72,8 +72,8 @@ jobs:
           # products; if xtool's output lacks it, build with SwiftPM directly.
           BUNDLE=$(find . -name "mlx-swift_Cmlx.bundle" -type d | head -1)
           if [ -z "$BUNDLE" ]; then
-            SONGSPIKE_WITH_ACE=1 swift build --triple arm64-apple-ios26.0 --sdk "$(xcrun --sdk iphoneos --show-sdk-path)" -c release
-            BUNDLE=$(find . -name "mlx-swift_Cmlx.bundle" -type d | head -1)
+            SONGSPIKE_WITH_ACE=1 swift build --build-system swiftbuild --triple arm64-apple-ios26.0 --sdk "$(xcrun --sdk iphoneos --show-sdk-path)" -c release
+            BUNDLE=$(find .build/out -name "mlx-swift_Cmlx.bundle" -type d | head -1)
           fi
           test -d "$BUNDLE" || { echo "ERROR: mlx-swift_Cmlx.bundle not found in build products"; exit 1; }
           cp -R "$BUNDLE" SongSpike.app/

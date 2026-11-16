@@ -76,7 +76,7 @@ jobs:
             BUNDLE=$(find . -name "mlx-swift_Cmlx.bundle" -type d | head -1)
           fi
           test -d "$BUNDLE" || { echo "ERROR: mlx-swift_Cmlx.bundle not found in build products"; exit 1; }
-        cp -R "$BUNDLE" SongSpike.app/
+          cp -R "$BUNDLE" SongSpike.app/
           # The engine's Metal library must be inside the bundle — MLX
           # fails at first GPU use without it. Fail loudly if absent.
           find SongSpike.app -name "*.metallib" -o -name "*Cmlx*.bundle" | grep -q . \

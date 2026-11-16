@@ -29,15 +29,23 @@ let package = Package(
     // iOS consumer fails planning ("product 'MLX' requires minimum
     // platform version 17.0 … but this target supports 15.0"). Adding
     // the iOS floor the code is actually built for fixes planning.
+    //
+    // SPIKE PATCH 2 (2026-11-16): trimmed to the ACEStepCore target only.
+    // The MLXACEStep / acestep-gates / test targets pull in
+    // mlx-engine-swift, whose 0.81.0 manifest floors its own targets at
+    // iOS 12 while its products (DesignScaffold iOS 16, MLX iOS 17)
+    // require more — SwiftPM graph validation then fails the whole
+    // build on macOS CI ("the library 'MLXEngineUI' requires ios 12.0,
+    // but depends on the product 'DesignScaffold' which requires
+    // ios 16.0"). SongSpike consumes only ACEStepCore, which depends
+    // solely on mlx-swift (verified: no MLXToolKit/MLXServe imports in
+    // Sources/ACEStepCore), so the engine dependency is dropped here.
     platforms: [.macOS(.v26), .iOS(.v17)],
     products: [
         .library(name: "ACEStepCore", targets: ["ACEStepCore"]),
-        .library(name: "MLXACEStep", targets: ["MLXACEStep"]),
-        .executable(name: "acestep-gates", targets: ["acestep-gates"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.32.3"),
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.71.0"),
     ],
     targets: [
         .target(
@@ -50,43 +58,6 @@ let package = Package(
             ],
             path: "Sources/ACEStepCore",
             swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
-        .target(
-            name: "MLXACEStep",
-            dependencies: [
-                "ACEStepCore",
-                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
-                .product(name: "MLX", package: "mlx-swift"),
-            ],
-            path: "Sources/MLXACEStep",
-            swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
-        .executableTarget(
-            name: "acestep-gates",
-            dependencies: [
-                "ACEStepCore", "MLXACEStep",
-                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
-                .product(name: "MLXServeCore", package: "mlx-engine-swift"),
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "MLXRandom", package: "mlx-swift"),
-            ],
-            path: "Sources/acestep-gates",
-            swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
-        .testTarget(
-            name: "ACEStepCoreTests",
-            dependencies: ["ACEStepCore"],
-            path: "Tests/ACEStepCoreTests"
-        ),
-        .testTarget(
-            name: "MLXACEStepTests",
-            dependencies: [
-                "ACEStepCore", "MLXACEStep",
-                .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
-                .product(name: "MLXServeCore", package: "mlx-engine-swift"),
-            ],
-            path: "Tests/MLXACEStepTests"
         ),
     ]
 )

@@ -36,9 +36,13 @@ let package = Package(
     platforms: [
         // The engine manifest declares only .macOS(.v26); it states no
         // iOS floor (ENGINE-NOTES.md #6). MLX Swift's general floor is
-        // iOS 17; André's test devices run iOS 26/27, so this is not
-        // load-bearing for the spike.
-        .iOS("17.0"),
+        // iOS 17; André's test devices run iOS 26/27.
+        // FLOOR RAISED 17 -> 26 after the first upload was rejected with
+        // ASC error 90725 ("built with the iOS 17.0 SDK"): xtool/SwiftPM
+        // stamps LC_BUILD_VERSION sdk from this declared floor, and
+        // Apple requires sdk >= 26 for uploads. The spike only targets
+        // André's iOS 27 devices, so the higher floor costs nothing.
+        .iOS("26.0"),
     ],
     products: [
         // xtool builds apps from a library product (same layout as

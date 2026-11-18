@@ -6,8 +6,8 @@ import Foundation
 struct BundleRepo: Sendable, Equatable {
     var repoID: String
     /// Approximate download size from the HF collection page. Kept for
-    /// reference only — Build 2's progress display uses the real byte
-    /// sizes from the HF blobs API, never this estimate.
+    /// reference only — progress display uses the real byte sizes from
+    /// the HF blobs API, never this estimate.
     var approxMegabytes: Double
 
     /// Local folder name = last path component of the repo ID.
@@ -69,6 +69,12 @@ enum ModelBundles {
 enum ModelDownloaderError: Error, CustomStringConvertible {
     case fileListFailed(repoID: String, underlying: String)
     case downloadFailed(file: String, underlying: String)
+    /// The device cannot hold the rest of the download. A first-class,
+    /// user-actionable state — never a silent stall (Build 3).
+    case insufficientSpace(neededBytes: Int64, availableBytes: Int64)
+    /// No byte progress for over a minute while a file was supposedly
+    /// downloading (Build 3 watchdog).
+    case stalled(file: String)
 
     var description: String {
         switch self {
@@ -76,6 +82,15 @@ enum ModelDownloaderError: Error, CustomStringConvertible {
             return "Could not list files for \(repoID): \(why)"
         case .downloadFailed(let file, let why):
             return "Download failed for \(file): \(why)"
+        case .insufficientSpace(let needed, let available):
+            let format = { (bytes: Int64) in
+                ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+            }
+            return "Not enough free space — this download needs \(format(needed)) more, "
+                + "but only \(format(available)) is free. Free up space and try again."
+        case .stalled(let file):
+            return "Download stalled on \(file) — no progress for over a minute. "
+                + "Check the connection and tap Resume to continue."
         }
     }
 }
@@ -88,6 +103,10 @@ enum ModelDownloaderError: Error, CustomStringConvertible {
 /// the plan is built, as files complete, and whenever resume data is
 /// captured. The per-repo `.complete` markers keep their Build 1
 /// meaning and are written from this state.
+///
+/// Build 3 keeps this format byte-compatible with Build 2 — André's
+/// on-device state (turbo repo complete, planner part-done) is read
+/// as-is, nothing already downloaded is fetched again.
 struct DownloadStateFile: Codable, Sendable {
     /// Tier of the most recently started download — the one `restore()`
     /// auto-resumes on launch.
@@ -118,11 +137,30 @@ struct FileDownloadState: Codable, Sendable {
 
 // MARK: - UI snapshot
 
+/// Truthful run state for the UI (Build 3). The models section renders
+/// its headline from this alone, so it can never say "Downloading"
+/// while nothing is actually running — the Build 2 screenshot showed
+/// "Downloading bundles…" and a Resume button at the same time because
+/// the headline ignored whether the run was alive.
+enum DownloadStatus: Sendable, Equatable {
+    case idle
+    case downloading
+    /// Stopped with a partial download on disk; Resume continues it.
+    case paused
+    /// Stopped on an error; the message says why.
+    case failed(String)
+    /// Stopped before (or during) the download because the device
+    /// cannot hold the remaining bytes.
+    case insufficientSpace(neededBytes: Int64, availableBytes: Int64)
+    case complete
+}
+
 /// Immutable progress snapshot for the UI, rebuilt from the persisted
 /// state plus the live task counters on every delegate callback.
 struct DownloadSnapshot: Sendable, Equatable {
     var tierRawValue: String = ""
     var isActive: Bool = false
+    var status: DownloadStatus = .idle
     /// Friendly name of the bundle currently downloading.
     var repoLabel: String?
     var fileName: String?
@@ -132,23 +170,47 @@ struct DownloadSnapshot: Sendable, Equatable {
     var bytesTotal: Int64 = 0
     var filesCompleted: Int = 0
     var filesTotal: Int = 0
+    /// Free space on the models volume, refreshed while a run is
+    /// active (Build 3); -1 while unknown.
+    var availableCapacityBytes: Int64 = -1
     /// A partial download exists for this tier and no task is running
     /// (e.g. the last attempt stopped on an error).
     var hasResumableState: Bool = false
+
+    /// True when the run stopped on an error (status carries why).
+    var isFailed: Bool {
+        if case .failed = status { return true }
+        return false
+    }
 
     static let empty = DownloadSnapshot()
 }
 
 // MARK: - Downloader
 
-/// Build 2 downloader. Downloads run on a BACKGROUND URLSession
+/// Downloads run on a BACKGROUND URLSession
 /// (`com.andrepato.songspike.downloads`), so transfers continue while
 /// the app is backgrounded or terminated and their events are delivered
 /// on the next launch. Files download one at a time in plan order —
-/// the same file set Build 1 fetched (every sibling of the four repos)
-/// — but the plan now carries real byte sizes from the HF blobs API,
-/// every interruption captures resume data into the persisted state,
-/// and `restore()` re-attaches to live tasks / auto-resumes on launch.
+/// every sibling of the four repos — with real byte sizes from the HF
+/// blobs API, resume data captured into the persisted state on every
+/// interruption, and `restore()` re-attaching / auto-resuming on
+/// launch.
+///
+/// Build 3 adds, after André's iPad ran OUT OF STORAGE mid-download
+/// and the stall looked like a hang:
+/// - a storage pre-flight gate (before a run starts, before the
+///   launch auto-resume proceeds, and before every file): remaining
+///   bytes for the tier vs the volume's available capacity for
+///   important usage, with a safety margin. Insufficient space stops
+///   the run in a dedicated, specific state — it never starts.
+/// - out-of-space write/completion errors are classified and routed
+///   to that same visible state instead of a generic failure.
+/// - a watchdog: no byte progress for ~60 s while a file is in flight
+///   cancels the task and stops the run with a visible "stalled"
+///   reason instead of hanging forever.
+/// - truthful UI state via `DownloadSnapshot.status`, and free-space
+///   reporting in the snapshot while downloading.
 ///
 /// Concurrency: all mutable state is guarded by `lock`; delegate
 /// callbacks arrive on a serial queue; the UI handlers are @Sendable
@@ -161,6 +223,11 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
 
     static let shared = ModelDownloader()
     static let backgroundSessionIdentifier = "com.andrepato.songspike.downloads"
+
+    /// Headroom kept free beyond the bytes still to download, so a
+    /// run that passes the gate can actually finish (temp-file churn,
+    /// other apps writing, rounding).
+    static let spaceSafetyMargin: Int64 = 512 * 1024 * 1024
 
     /// Progress updates, invoked whenever anything changes.
     var onSnapshot: (@Sendable (DownloadSnapshot) -> Void)? {
@@ -184,8 +251,20 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
     private var currentRepoID: String?
     private var currentFileName: String?
     private var currentTaskIdentifier: Int?
+    private var currentDownloadTask: URLSessionDownloadTask?
     private var backgroundCompletionHandler: (() -> Void)?
     private var lastPersistAt = Date.distantPast
+    // Build 3 state
+    private var lastFailureMessage: String?
+    private var spaceBlock: (needed: Int64, available: Int64)?
+    private var lastProgressAt = Date.distantPast
+    private var hasBegunFile = false
+    private var watchdogCancelPending = false
+    private var watchdogTimer: DispatchSourceTimer?
+    private var cachedAvailableCapacity: Int64 = -1
+    private var lastCapacityCheckAt = Date.distantPast
+
+    private let watchdogQueue = DispatchQueue(label: "com.andrepato.songspike.watchdog")
 
     override init() {
         persisted = Self.loadPersistedState() ?? DownloadStateFile()
@@ -206,6 +285,9 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         }
         running = true
         currentTier = tier
+        lastFailureMessage = nil
+        spaceBlock = nil
+        lastProgressAt = Date()
         persisted.activeTier = tier.rawValue
         persistLocked()
         lock.unlock()
@@ -217,14 +299,17 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
                 self.finishRun(with: .failure(error))
                 return
             }
-            self.reconcileAndAdvance(session: session)
+            self.proceedWithRun(session: session, notify: true)
         }
     }
 
     /// Launch-time restore: re-attaches to the background session and,
     /// if the persisted state shows an incomplete download for the
     /// active tier, resumes it without the user re-tapping Download —
-    /// adopting a still-running background task when one exists.
+    /// adopting a still-running background task when one exists. The
+    /// storage gate applies here too: if the device cannot hold the
+    /// remaining bytes, the resume does not start and the snapshot
+    /// carries the specific not-enough-space state instead.
     func restore() {
         let session = ensureSession()
         lock.lock()
@@ -240,6 +325,7 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         }
         running = true
         currentTier = tier
+        lastProgressAt = Date()
         lock.unlock()
         emitSnapshot()
         Task {
@@ -247,7 +333,7 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             // idempotent and keeps stored per-file state. Offline is
             // fine — the persisted plan is enough to resume its files.
             try? await self.buildPlan(tier: tier)
-            self.reconcileAndAdvance(session: session)
+            self.proceedWithRun(session: session, notify: false)
         }
     }
 
@@ -292,6 +378,186 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         let created = URLSession(configuration: configuration, delegate: self, delegateQueue: queue)
         session = created
         return created
+    }
+
+    // MARK: - Storage gate (Build 3)
+
+    /// Free space on the models volume as iOS reports it for important
+    /// usage — this counts purgeable space the system can reclaim,
+    /// which is the number that decides whether writes will succeed.
+    static func availableCapacity() -> Int64? {
+        let directory = ModelBundles.modelsDirectory
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(iOS)
+        if let values = try? directory.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+           let capacity = values.volumeAvailableCapacityForImportantUsage {
+            return capacity
+        }
+        #endif
+        if let values = try? directory.resourceValues(
+            forKeys: [.volumeAvailableCapacityKey]),
+           let capacity = values.volumeAvailableCapacity {
+            return Int64(capacity)
+        }
+        return nil
+    }
+
+    /// Bytes still to fetch for the tier: sum over incomplete files of
+    /// (size − already downloaded). Files with unknown size count as 0
+    /// (in practice only tiny metadata lacks a blobs-API size).
+    /// Call with lock held.
+    private func remainingBytesLocked(tier: PlannerTier) -> Int64 {
+        guard let tierState = persisted.tiers[tier.rawValue] else { return 0 }
+        var remaining: Int64 = 0
+        for repoState in tierState.repos {
+            for file in repoState.files where !file.completed && file.size > 0 {
+                remaining += max(0, file.size - file.bytesDownloaded)
+            }
+        }
+        return remaining
+    }
+
+    /// Self-locking variant for callers that don't hold the lock.
+    private func remainingBytes(tier: PlannerTier) -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return remainingBytesLocked(tier: tier)
+    }
+
+    /// The pre-flight check. Returns true when the run may proceed.
+    /// On insufficient space the run is stopped in the dedicated
+    /// space-blocked state (visible, specific, resumable after the
+    /// user frees space) and false is returned. When capacity cannot
+    /// be measured at all, the run is allowed through — the write
+    /// errors, if any, are classified when they happen.
+    private func checkSpaceGate(tier: PlannerTier, notify: Bool) -> Bool {
+        guard let available = Self.availableCapacity() else { return true }
+        let remaining = remainingBytes(tier: tier)
+        if available >= remaining + Self.spaceSafetyMargin {
+            lock.lock()
+            spaceBlock = nil
+            lock.unlock()
+            return true
+        }
+        blockRunForInsufficientSpace(neededBytes: remaining, availableBytes: available, notify: notify)
+        return false
+    }
+
+    /// Stops the run in the insufficient-space state. `notify` also
+    /// fires `onFinished` with the specific error (user-initiated
+    /// attempts); the launch auto-resume passes false so the message
+    /// lives in the models section without an extra error banner.
+    private func blockRunForInsufficientSpace(neededBytes: Int64, availableBytes: Int64, notify: Bool) {
+        lock.lock()
+        let wasRunning = running
+        running = false
+        currentTaskIdentifier = nil
+        currentDownloadTask = nil
+        currentRepoID = nil
+        currentFileName = nil
+        hasBegunFile = false
+        spaceBlock = (needed: neededBytes, available: availableBytes)
+        lastFailureMessage = nil
+        cachedAvailableCapacity = availableBytes
+        lastCapacityCheckAt = Date()
+        let handler = finishedHandler
+        lock.unlock()
+        stopWatchdog()
+        emitSnapshot()
+        if notify && wasRunning {
+            handler?(.failure(ModelDownloaderError.insufficientSpace(
+                neededBytes: neededBytes, availableBytes: availableBytes)))
+        }
+    }
+
+    /// After the plan is built: storage gate first, then advance.
+    private func proceedWithRun(session: URLSession, notify: Bool) {
+        lock.lock()
+        guard running, let tier = currentTier else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        guard checkSpaceGate(tier: tier, notify: notify) else { return }
+        startWatchdog()
+        reconcileAndAdvance(session: session)
+    }
+
+    /// True when an error is a write that failed for lack of space —
+    /// POSIX ENOSPC under Cocoa/URL error wrappers (Build 3 routing:
+    /// these become the insufficient-space state, not a generic
+    /// failure and never a silent stall).
+    static func isOutOfSpaceError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain && nsError.code == 28 { // ENOSPC
+            return true
+        }
+        if nsError.domain == NSCocoaErrorDomain
+            && nsError.code == CocoaError.Code.fileWriteOutOfSpace.rawValue {
+            return true
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isOutOfSpaceError(underlying)
+        }
+        return false
+    }
+
+    // MARK: - Watchdog (Build 3)
+
+    private func startWatchdog() {
+        lock.lock()
+        if watchdogTimer != nil {
+            lock.unlock()
+            return
+        }
+        let timer = DispatchSource.makeTimerSource(queue: watchdogQueue)
+        timer.schedule(deadline: .now() + 5, repeating: .seconds(5))
+        timer.setEventHandler { [weak self] in
+            self?.watchdogTick()
+        }
+        watchdogTimer = timer
+        lock.unlock()
+        timer.resume()
+    }
+
+    private func stopWatchdog() {
+        lock.lock()
+        let timer = watchdogTimer
+        watchdogTimer = nil
+        watchdogCancelPending = false
+        lock.unlock()
+        timer?.cancel()
+    }
+
+    /// Every 5 s while a run is active: if a file has been in flight
+    /// for over a minute with zero byte progress, the transfer is
+    /// dead — cancel it and stop the run with a visible "stalled"
+    /// reason (the cancellation's error callback completes the stop).
+    /// If no file is in flight but the run has made no progress for
+    /// over a minute after files were begun (a dropped callback),
+    /// stop the same way. Either way the UI never sits on a fake
+    /// "Downloading" forever.
+    private func watchdogTick() {
+        lock.lock()
+        guard running else {
+            lock.unlock()
+            return
+        }
+        let idle = Date().timeIntervalSince(lastProgressAt)
+        guard idle > 60, hasBegunFile else {
+            lock.unlock()
+            return
+        }
+        if let task = currentDownloadTask {
+            watchdogCancelPending = true
+            lock.unlock()
+            task.cancel()
+            return
+        }
+        let fileName = currentFileName ?? "the current file"
+        lock.unlock()
+        finishRun(with: .failure(ModelDownloaderError.stalled(file: fileName)))
     }
 
     // MARK: - Plan
@@ -374,6 +640,9 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             tierState.repos.append(RepoDownloadState(repoID: repoID, files: files))
         }
         persisted.tiers[tier.rawValue] = tierState
+        // Plan building is run progress too — don't let the watchdog
+        // mistake a slow plan fetch for a stalled transfer.
+        lastProgressAt = Date()
         persistLocked()
         lock.unlock()
     }
@@ -432,6 +701,9 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
                 self.currentRepoID = next.repo.repoID
                 self.currentFileName = next.file.name
                 self.currentTaskIdentifier = live.taskIdentifier
+                self.currentDownloadTask = live
+                self.hasBegunFile = true
+                self.lastProgressAt = Date()
                 // The plan is strictly one file at a time — cancel any
                 // stray tasks from an earlier interrupted state.
                 for other in downloads where other.taskIdentifier != live.taskIdentifier {
@@ -447,6 +719,10 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
     }
 
     private func beginFile(session: URLSession, tier: PlannerTier, repo: BundleRepo, file: FileDownloadState) {
+        // Per-file storage re-check (Build 3): space can shrink while
+        // earlier files download; never start a file the device
+        // cannot hold the rest of.
+        guard checkSpaceGate(tier: tier, notify: true) else { return }
         let task: URLSessionDownloadTask
         if let resumeData = file.resumeData, !resumeData.isEmpty {
             task = session.downloadTask(withResumeData: resumeData)
@@ -461,6 +737,9 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         currentRepoID = repo.repoID
         currentFileName = file.name
         currentTaskIdentifier = task.taskIdentifier
+        currentDownloadTask = task
+        hasBegunFile = true
+        lastProgressAt = Date()
         lock.unlock()
         task.resume()
         emitSnapshot()
@@ -474,6 +753,7 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             return
         }
         currentTaskIdentifier = nil
+        currentDownloadTask = nil
         currentRepoID = nil
         currentFileName = nil
         guard let next = nextIncompleteLocked(tier: tier) else {
@@ -490,14 +770,26 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         let wasRunning = running
         running = false
         currentTaskIdentifier = nil
+        currentDownloadTask = nil
         currentRepoID = nil
         currentFileName = nil
-        if case .success = result {
+        hasBegunFile = false
+        switch result {
+        case .success:
+            lastFailureMessage = nil
+            spaceBlock = nil
             persistLocked()
+        case .failure(let error):
+            if let modelError = error as? ModelDownloaderError {
+                lastFailureMessage = modelError.description
+            } else {
+                lastFailureMessage = error.localizedDescription
+            }
         }
         let handler = finishedHandler
         let tier = currentTier
         lock.unlock()
+        stopWatchdog()
         if case .success = result, let tier {
             refreshMarkers(tier: tier)
         }
@@ -518,6 +810,7 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
     ) {
         guard let match = matchFile(for: downloadTask) else { return }
         lock.lock()
+        lastProgressAt = Date()
         updateFileLocked(tier: match.tier, repoID: match.repoID, fileName: match.fileName) { state in
             state.bytesDownloaded = totalBytesWritten
             if state.size <= 0, totalBytesExpectedToWrite > 0 {
@@ -536,7 +829,20 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        guard let match = matchFile(for: downloadTask) else { return }
+        guard let match = matchFile(for: downloadTask) else {
+            // Never fail silently (Build 3): an unmatched completion
+            // means a downloaded file could not be placed. Record it
+            // where the UI can show it; the temp file is gone when
+            // this callback returns, so the file will be re-fetched
+            // on the next run.
+            lock.lock()
+            if lastFailureMessage == nil {
+                lastFailureMessage = "A finished download could not be matched to a model file; it will be fetched again on Resume."
+            }
+            lock.unlock()
+            emitSnapshot()
+            return
+        }
         let repo = BundleRepo(repoID: match.repoID, approxMegabytes: 0)
         let destination = ModelBundles.repoDirectory(repo).appendingPathComponent(match.fileName)
         var moveError: Error?
@@ -553,31 +859,72 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             moveError = error
         }
 
-        lock.lock()
-        let isCurrent = running && currentTaskIdentifier == downloadTask.taskIdentifier
-        if moveError == nil {
-            let landedSize = Self.fileSize(at: destination)
-            updateFileLocked(tier: match.tier, repoID: match.repoID, fileName: match.fileName) { state in
-                state.completed = true
-                state.resumeData = nil
-                if let landedSize {
-                    state.bytesDownloaded = landedSize
-                    if state.size <= 0 { state.size = landedSize }
-                } else if state.size > 0 {
-                    state.bytesDownloaded = state.size
-                }
-            }
-            persistLocked()
-        }
-        lock.unlock()
-
         if let moveError {
-            if isCurrent {
-                finishRun(with: .failure(ModelDownloaderError.downloadFailed(
-                    file: match.fileName, underlying: "\(moveError)")))
+            // Out of space is a first-class state, not a generic
+            // failure (Build 3) — and a failed move is never swallowed
+            // just because the file wasn't the "current" one.
+            if Self.isOutOfSpaceError(moveError) {
+                blockRunForInsufficientSpace(
+                    neededBytes: remainingBytes(tier: match.tier),
+                    availableBytes: Self.availableCapacity() ?? 0,
+                    notify: true)
+            } else {
+                lock.lock()
+                let isCurrent = running && currentTaskIdentifier == downloadTask.taskIdentifier
+                if !isCurrent && lastFailureMessage == nil {
+                    lastFailureMessage = "Could not save \(match.fileName): \(moveError.localizedDescription)"
+                }
+                lock.unlock()
+                if isCurrent {
+                    finishRun(with: .failure(ModelDownloaderError.downloadFailed(
+                        file: match.fileName, underlying: "\(moveError)")))
+                } else {
+                    emitSnapshot()
+                }
             }
             return
         }
+
+        // Verify what landed before calling it complete (Build 3):
+        // a short or wrong-sized file must not poison the bundle.
+        let landedSize = Self.fileSize(at: destination)
+        let expectedSize = storedSize(tier: match.tier, repoID: match.repoID, fileName: match.fileName)
+        if let expectedSize, expectedSize > 0, let landedSize, landedSize != expectedSize {
+            try? FileManager.default.removeItem(at: destination)
+            lock.lock()
+            let isCurrent = running && currentTaskIdentifier == downloadTask.taskIdentifier
+            lock.unlock()
+            if isCurrent {
+                finishRun(with: .failure(ModelDownloaderError.downloadFailed(
+                    file: match.fileName,
+                    underlying: "saved file is \(landedSize) bytes, expected \(expectedSize)")))
+            } else {
+                lock.lock()
+                if lastFailureMessage == nil {
+                    lastFailureMessage = "Saved copy of \(match.fileName) had the wrong size and was discarded; it will be fetched again on Resume."
+                }
+                lock.unlock()
+                emitSnapshot()
+            }
+            return
+        }
+
+        lock.lock()
+        let isCurrent = running && currentTaskIdentifier == downloadTask.taskIdentifier
+        lastProgressAt = Date()
+        updateFileLocked(tier: match.tier, repoID: match.repoID, fileName: match.fileName) { state in
+            state.completed = true
+            state.resumeData = nil
+            if let landedSize {
+                state.bytesDownloaded = landedSize
+                if state.size <= 0 { state.size = landedSize }
+            } else if state.size > 0 {
+                state.bytesDownloaded = state.size
+            }
+        }
+        persistLocked()
+        lock.unlock()
+
         writeMarkerIfRepoComplete(tier: match.tier, repo: repo)
         emitSnapshot()
         if isCurrent {
@@ -601,6 +948,13 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             lock.unlock()
             return
         }
+        // The watchdog cancelled this task for stalling: the stop is
+        // completed below with the stalled reason, not the raw
+        // cancellation error (Build 3).
+        let watchdogCancel = watchdogCancelPending && isCurrent
+        if watchdogCancel {
+            watchdogCancelPending = false
+        }
         // The resume-data userInfo key, by its documented string value
         // (the NSURLSessionDownloadTaskResumeData constant).
         let resumeData = (error as NSError)
@@ -620,13 +974,25 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         }
         if isCurrent {
             currentTaskIdentifier = nil
+            currentDownloadTask = nil
         }
         persistLocked()
         lock.unlock()
         emitSnapshot()
         if isCurrent {
-            finishRun(with: .failure(ModelDownloaderError.downloadFailed(
-                file: match.fileName, underlying: error.localizedDescription)))
+            if watchdogCancel {
+                finishRun(with: .failure(ModelDownloaderError.stalled(file: match.fileName)))
+            } else if Self.isOutOfSpaceError(error) {
+                // A transfer that died because the disk filled is the
+                // insufficient-space state, not a generic failure.
+                blockRunForInsufficientSpace(
+                    neededBytes: remainingBytes(tier: match.tier),
+                    availableBytes: Self.availableCapacity() ?? 0,
+                    notify: true)
+            } else {
+                finishRun(with: .failure(ModelDownloaderError.downloadFailed(
+                    file: match.fileName, underlying: error.localizedDescription)))
+            }
         }
     }
 
@@ -711,6 +1077,16 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         persisted.tiers[tier.rawValue] = tierState
     }
 
+    /// Self-locking read of a file's planned size (-1 when unknown).
+    private func storedSize(tier: PlannerTier, repoID: String, fileName: String) -> Int64? {
+        lock.lock()
+        defer { lock.unlock() }
+        return persisted.tiers[tier.rawValue]?
+            .repos.first { $0.repoID == repoID }?
+            .files.first { $0.name == fileName }?
+            .size
+    }
+
     private func refreshMarkers(tier: PlannerTier) {
         for repo in ModelBundles.repos(for: tier) {
             writeMarkerIfRepoComplete(tier: tier, repo: repo)
@@ -732,11 +1108,25 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
     // MARK: - Snapshot
 
     private func emitSnapshot() {
+        updateCachedCapacity()
         lock.lock()
         let handler = snapshotHandler
         let snapshot = snapshotLocked()
         lock.unlock()
         handler?(snapshot)
+    }
+
+    /// Keeps the snapshot's free-space figure fresh (checked at most
+    /// every 5 s) without a syscall on every progress callback.
+    private func updateCachedCapacity() {
+        lock.lock()
+        let stale = Date().timeIntervalSince(lastCapacityCheckAt) > 5
+        lock.unlock()
+        guard stale, let capacity = Self.availableCapacity() else { return }
+        lock.lock()
+        cachedAvailableCapacity = capacity
+        lastCapacityCheckAt = Date()
+        lock.unlock()
     }
 
     /// Call with lock held.
@@ -745,7 +1135,11 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         let tierRaw = currentTier?.rawValue ?? persisted.activeTier ?? ""
         snapshot.tierRawValue = tierRaw
         snapshot.isActive = running
-        guard let tierState = persisted.tiers[tierRaw] else { return snapshot }
+        snapshot.availableCapacityBytes = cachedAvailableCapacity
+        guard let tierState = persisted.tiers[tierRaw] else {
+            snapshot.status = running ? .downloading : .idle
+            return snapshot
+        }
 
         var total: Int64 = 0
         var downloaded: Int64 = 0
@@ -772,6 +1166,23 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         snapshot.filesCompleted = filesCompleted
         snapshot.overallFraction = total > 0 ? Double(downloaded) / Double(total) : 0
         snapshot.hasResumableState = !running && filesTotal > 0 && filesCompleted < filesTotal
+
+        // Truthful status (Build 3): derived from the run's actual
+        // state, in priority order — a blocked or failed run never
+        // reports as downloading.
+        if filesTotal > 0 && filesCompleted == filesTotal {
+            snapshot.status = .complete
+        } else if let block = spaceBlock {
+            snapshot.status = .insufficientSpace(neededBytes: block.needed, availableBytes: block.available)
+        } else if running {
+            snapshot.status = .downloading
+        } else if let message = lastFailureMessage {
+            snapshot.status = .failed(message)
+        } else if filesTotal > 0 && filesCompleted < filesTotal {
+            snapshot.status = .paused
+        } else {
+            snapshot.status = .idle
+        }
 
         if let repoID = currentRepoID, let fileName = currentFileName,
            let tier = PlannerTier(rawValue: tierRaw) {

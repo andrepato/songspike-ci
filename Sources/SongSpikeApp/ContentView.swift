@@ -54,21 +54,43 @@ struct ContentView: View {
     }
 
     /// Live download feedback: which bundle and file are downloading,
-    /// per-file and overall progress, bytes downloaded of total, and
-    /// the file count. Downloads run on a background session, so they
-    /// continue while the app is backgrounded or closed and resume
-    /// automatically on the next launch.
+    /// per-file and overall progress, bytes downloaded of total, the
+    /// file count, and the device's free space. The headline follows
+    /// the snapshot's truthful status (Build 3): it says "Downloading"
+    /// only while a transfer is actually running — a stopped run shows
+    /// paused / failed / not-enough-space with its reason and a Resume
+    /// or Check-again button, never both states at once.
     private var downloadProgress: some View {
         let snapshot = viewModel.downloadSnapshot
         return VStack(alignment: .leading, spacing: 6) {
-            if let repoLabel = snapshot.repoLabel {
+            if case .insufficientSpace(let needed, let available) = snapshot.status {
+                Text("Not enough free space")
+                    .font(.headline)
+                Text("This download needs \(Self.formatBytes(needed)) more, "
+                    + "but only \(Self.formatBytes(available)) is free. "
+                    + "Free up space, then try again.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if case .failed(let message) = snapshot.status {
+                Text("Download stopped")
+                    .font(.headline)
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if snapshot.status == .paused {
+                Text("Download paused")
+                    .font(.headline)
+            } else if snapshot.status == .complete {
+                Text("Download complete")
+                    .font(.headline)
+            } else if let repoLabel = snapshot.repoLabel {
                 Text("Downloading: \(repoLabel)")
                     .font(.headline)
             } else {
                 Text("Downloading bundles…")
                     .font(.headline)
             }
-            if let fileName = snapshot.fileName {
+            if snapshot.status == .downloading, let fileName = snapshot.fileName {
                 Text(fileName)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -82,12 +104,22 @@ struct ContentView: View {
             Text("Files \(snapshot.filesCompleted) of \(snapshot.filesTotal)")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            if snapshot.isActive {
-                Text("Continues in the background if you leave the app, "
-                    + "and resumes automatically after a close or a failed file.")
+            if snapshot.availableCapacityBytes >= 0 {
+                Text("Free space: \(Self.formatBytes(snapshot.availableCapacityBytes))")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-            } else {
+            }
+            if snapshot.status == .downloading {
+                Text("Continues in the background if you leave the app. "
+                    + "If a download stops, the reason appears here and "
+                    + "finished files are kept.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if case .insufficientSpace = snapshot.status {
+                Button("Check again & resume") {
+                    viewModel.downloadModels()
+                }
+            } else if snapshot.status == .paused || snapshot.isFailed {
                 Button("Resume download") {
                     viewModel.downloadModels()
                 }

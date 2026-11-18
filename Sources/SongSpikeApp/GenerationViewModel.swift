@@ -41,8 +41,18 @@ final class GenerationViewModel: ObservableObject {
 
     // Download state
     @Published private(set) var modelsReady = false
-    @Published private(set) var isDownloading = false
-    @Published private(set) var downloadFraction: Double = 0
+    @Published private(set) var downloadSnapshot = DownloadSnapshot.empty
+
+    /// True while the background download session has a live run.
+    var isDownloading: Bool { downloadSnapshot.isActive }
+
+    /// Show the detailed download UI when a download is running, or
+    /// when the selected tier has a partial download on disk.
+    var showDownloadProgress: Bool {
+        let snapshot = downloadSnapshot
+        guard snapshot.filesTotal > 0, snapshot.overallFraction < 1 else { return false }
+        return snapshot.isActive || snapshot.tierRawValue == tier.rawValue
+    }
 
     // Results
     @Published private(set) var lastOutputURL: URL?
@@ -53,7 +63,7 @@ final class GenerationViewModel: ObservableObject {
     let durationChoices = [30, 60, 180]
 
     private let engine: MusicEngine = MLXACEStepEngine()
-    private let downloader = ModelDownloader()
+    private let downloader = ModelDownloader.shared
     private let cancellation = CancellationFlag()
     private var logger: RunLogger?
     private var hasRunSinceLaunch = false
@@ -63,6 +73,31 @@ final class GenerationViewModel: ObservableObject {
         UIDevice.current.isBatteryMonitoringEnabled = true
         refreshModelsReady()
         sampleMemory()
+        wireDownloader()
+        // Re-attach to the background session and auto-resume an
+        // interrupted download from the persisted state.
+        downloader.restore()
+    }
+
+    private func wireDownloader() {
+        downloader.onSnapshot = { [weak self] snapshot in
+            Task { @MainActor in
+                guard let self else { return }
+                self.downloadSnapshot = snapshot
+                if snapshot.filesTotal > 0, snapshot.filesCompleted == snapshot.filesTotal {
+                    self.refreshModelsReady()
+                }
+            }
+        }
+        downloader.onFinished = { [weak self] result in
+            Task { @MainActor in
+                guard let self else { return }
+                if case .failure(let error) = result {
+                    self.errorMessage = "\(error)"
+                }
+                self.refreshModelsReady()
+            }
+        }
     }
 
     // MARK: - Paths
@@ -91,24 +126,8 @@ final class GenerationViewModel: ObservableObject {
     }
 
     func downloadModels() {
-        guard !isDownloading else { return }
-        isDownloading = true
-        downloadFraction = 0
         errorMessage = nil
-        let tier = tier
-        Task {
-            do {
-                try await downloader.download(tier: tier) { [weak self] fraction in
-                    Task { @MainActor in
-                        self?.downloadFraction = fraction
-                    }
-                }
-                refreshModelsReady()
-            } catch {
-                errorMessage = "\(error)"
-            }
-            isDownloading = false
-        }
+        downloader.start(tier: tier)
     }
 
     // MARK: - Generation

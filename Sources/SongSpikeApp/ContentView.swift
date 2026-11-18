@@ -38,15 +38,8 @@ struct ContentView: View {
         Section("Model bundles") {
             if viewModel.modelsReady {
                 Label("Bundles ready (\(viewModel.tier.rawValue) tier)", systemImage: "checkmark.circle")
-            } else if viewModel.isDownloading {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Downloading bundles… \(Int(viewModel.downloadFraction * 100))%")
-                    ProgressView(value: viewModel.downloadFraction)
-                    Text("≈ 8 GB on Wi-Fi. Stored in Application Support; "
-                        + "the app binary stays small.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
+            } else if viewModel.showDownloadProgress {
+                downloadProgress
             } else {
                 Button("Download model bundles (≈ 8 GB)") {
                     viewModel.downloadModels()
@@ -58,6 +51,52 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    /// Live download feedback: which bundle and file are downloading,
+    /// per-file and overall progress, bytes downloaded of total, and
+    /// the file count. Downloads run on a background session, so they
+    /// continue while the app is backgrounded or closed and resume
+    /// automatically on the next launch.
+    private var downloadProgress: some View {
+        let snapshot = viewModel.downloadSnapshot
+        return VStack(alignment: .leading, spacing: 6) {
+            if let repoLabel = snapshot.repoLabel {
+                Text("Downloading: \(repoLabel)")
+                    .font(.headline)
+            } else {
+                Text("Downloading bundles…")
+                    .font(.headline)
+            }
+            if let fileName = snapshot.fileName {
+                Text(fileName)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                ProgressView(value: snapshot.fileFraction)
+            }
+            ProgressView(value: snapshot.overallFraction)
+            Text("\(Int(snapshot.overallFraction * 100))% — "
+                + "\(Self.formatBytes(snapshot.bytesDownloaded)) of \(Self.formatBytes(snapshot.bytesTotal))")
+                .font(.footnote)
+            Text("Files \(snapshot.filesCompleted) of \(snapshot.filesTotal)")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            if snapshot.isActive {
+                Text("Continues in the background if you leave the app, "
+                    + "and resumes automatically after a close or a failed file.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                Button("Resume download") {
+                    viewModel.downloadModels()
+                }
+            }
+        }
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
     private var songSection: some View {

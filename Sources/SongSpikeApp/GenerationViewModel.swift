@@ -27,7 +27,10 @@ final class GenerationViewModel: ObservableObject {
         + "Valhalla is calling me."
     @Published var durationSeconds: Int = 60
     @Published var tier: PlannerTier = .int8 {
-        didSet { refreshModelsReady() }
+        didSet {
+            refreshModelsReady()
+            downloader.repairScan(tier: tier)
+        }
     }
 
     // Live run state
@@ -42,6 +45,10 @@ final class GenerationViewModel: ObservableObject {
     // Download state
     @Published private(set) var modelsReady = false
     @Published private(set) var downloadSnapshot = DownloadSnapshot.empty
+    /// A model file the integrity checks found corrupt (Build 4):
+    /// the models section names it and offers Repair, which
+    /// re-downloads just that file.
+    @Published private(set) var corruptFileName: String?
 
     /// True while the background download session has a live run.
     var isDownloading: Bool { downloadSnapshot.isActive }
@@ -77,6 +84,10 @@ final class GenerationViewModel: ObservableObject {
         // Re-attach to the background session and auto-resume an
         // interrupted download from the persisted state.
         downloader.restore()
+        // Build 4: validate what earlier builds called complete —
+        // a corrupt file (André's turbo model) is repaired here,
+        // before it can poison a generation.
+        downloader.repairScan(tier: tier)
     }
 
     private func wireDownloader() {
@@ -84,8 +95,12 @@ final class GenerationViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.downloadSnapshot = snapshot
-                if snapshot.filesTotal > 0, snapshot.filesCompleted == snapshot.filesTotal {
-                    self.refreshModelsReady()
+                // Refresh on every snapshot (Build 4): a repair scan
+                // can REMOVE a repo's .complete marker, and readiness
+                // must drop the moment it does.
+                self.refreshModelsReady()
+                if snapshot.status == .complete {
+                    self.corruptFileName = nil
                 }
             }
         }
@@ -130,12 +145,52 @@ final class GenerationViewModel: ObservableObject {
         downloader.start(tier: tier)
     }
 
+    /// Re-downloads just the file the integrity checks named as
+    /// corrupt (Build 4), through the downloader's normal
+    /// storage-gated flow.
+    func repairCorruptFile() {
+        guard let name = corruptFileName else { return }
+        corruptFileName = nil
+        errorMessage = nil
+        downloader.repairFile(tier: tier, fileName: name)
+    }
+
+    /// Cheap pre-generation integrity check (Build 4): structurally
+    /// validate every safetensors on disk for the tier and return
+    /// the first corrupt file's name. Reads only file headers, so it
+    /// costs milliseconds — and it catches exactly the failure that
+    /// reached the engine on André's device ("Invalid json header
+    /// length") before the engine ever sees the file.
+    private static func firstCorruptSafetensors(tier: PlannerTier) -> String? {
+        for repo in ModelBundles.repos(for: tier) {
+            let directory = ModelBundles.repoDirectory(repo)
+            guard let entries = try? FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil) else { continue }
+            for url in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+            where url.lastPathComponent.hasSuffix(".safetensors") {
+                if !ModelIntegrity.validateSafetensorsHeader(at: url) {
+                    return url.lastPathComponent
+                }
+            }
+        }
+        return nil
+    }
+
     // MARK: - Generation
 
     func generate() {
         guard !isGenerating else { return }
         guard modelsReady else {
             errorMessage = "Model bundles for the \(tier.rawValue) tier are not downloaded yet."
+            return
+        }
+        // Build 4 pre-flight: a corrupt model file gets a clear
+        // message and a one-file Repair here, not a cryptic engine
+        // error after the load starts.
+        if let corrupt = Self.firstCorruptSafetensors(tier: tier) {
+            corruptFileName = corrupt
+            errorMessage = "A model file looks corrupted: \(corrupt). "
+                + "Tap Repair to re-download just that file."
             return
         }
         isGenerating = true
@@ -191,6 +246,17 @@ final class GenerationViewModel: ObservableObject {
                 outcome = "failed"
                 notes = "\(error)"
                 errorMessage = "\(error)"
+                // Build 4 safety net: a load failure that names the
+                // safetensors layer gets translated into the
+                // corrupted-file message + Repair, with the corrupt
+                // file identified by the same header check the
+                // pre-flight uses.
+                if "\(error)".lowercased().contains("safetensors"),
+                   let corrupt = Self.firstCorruptSafetensors(tier: tier) {
+                    corruptFileName = corrupt
+                    errorMessage = "A model file looks corrupted: \(corrupt). "
+                        + "Tap Repair to re-download just that file."
+                }
             }
 
             ticker?.cancel()

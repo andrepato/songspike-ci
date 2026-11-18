@@ -75,6 +75,10 @@ enum ModelDownloaderError: Error, CustomStringConvertible {
     /// No byte progress for over a minute while a file was supposedly
     /// downloading (Build 3 watchdog).
     case stalled(file: String)
+    /// A downloaded (or previously trusted) copy failed integrity
+    /// validation — safetensors header check or SHA-256 mismatch —
+    /// and was discarded (Build 4).
+    case corruptFile(file: String)
 
     var description: String {
         switch self {
@@ -91,6 +95,9 @@ enum ModelDownloaderError: Error, CustomStringConvertible {
         case .stalled(let file):
             return "Download stalled on \(file) — no progress for over a minute. "
                 + "Check the connection and tap Resume to continue."
+        case .corruptFile(let file):
+            return "The copy of \(file) failed its integrity check and was discarded. "
+                + "Tap Resume to download it again."
         }
     }
 }
@@ -106,7 +113,10 @@ enum ModelDownloaderError: Error, CustomStringConvertible {
 ///
 /// Build 3 keeps this format byte-compatible with Build 2 — André's
 /// on-device state (turbo repo complete, planner part-done) is read
-/// as-is, nothing already downloaded is fetched again.
+/// as-is, nothing already downloaded is fetched again. Build 4 adds
+/// per-file integrity fields (expected SHA-256, hash-verified flag,
+/// validation failure count) via a manual decoder that defaults
+/// missing keys, so Build 2/3 state still loads unchanged.
 struct DownloadStateFile: Codable, Sendable {
     /// Tier of the most recently started download — the one `restore()`
     /// auto-resumes on launch.
@@ -133,6 +143,60 @@ struct FileDownloadState: Codable, Sendable {
     /// failed (base64 in the JSON via Data's default Codable). A file
     /// with resume data resumes mid-file; without it, it restarts.
     var resumeData: Data?
+    /// Expected SHA-256 from the HF blobs API (`lfs.sha256`), present
+    /// for every LFS file in these repos — all the safetensors carry
+    /// one (Build 4). Nil for small non-LFS files and for state
+    /// written before the plan was refreshed by Build 4.
+    var sha256: String? = nil
+    /// The on-disk copy passed SHA-256 verification against `sha256`.
+    /// Reset whenever the file is (re)downloaded or invalidated, so a
+    /// file is hash-verified exactly once per landed copy.
+    var hashVerified: Bool = false
+    /// Times this file failed integrity validation (repair scan or
+    /// the completion path). At 2 the automatic repair stops and the
+    /// file waits for the manual Repair action, so a persistently
+    /// bad download cannot loop forever.
+    var integrityFailures: Int = 0
+
+    // Manual Codable: the synthesized decoder throws on missing keys
+    // even for properties with defaults, which would make Build 2/3
+    // state files (no sha256 / hashVerified / integrityFailures)
+    // unreadable. Every field decodes as decodeIfPresent with the
+    // same defaults, so old state loads unchanged and good files are
+    // never re-downloaded.
+    private enum CodingKeys: String, CodingKey {
+        case name, size, completed, bytesDownloaded, resumeData
+        case sha256, hashVerified, integrityFailures
+    }
+
+    init(name: String, size: Int64 = -1) {
+        self.name = name
+        self.size = size
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        size = try container.decodeIfPresent(Int64.self, forKey: .size) ?? -1
+        completed = try container.decodeIfPresent(Bool.self, forKey: .completed) ?? false
+        bytesDownloaded = try container.decodeIfPresent(Int64.self, forKey: .bytesDownloaded) ?? 0
+        resumeData = try container.decodeIfPresent(Data.self, forKey: .resumeData)
+        sha256 = try container.decodeIfPresent(String.self, forKey: .sha256)
+        hashVerified = try container.decodeIfPresent(Bool.self, forKey: .hashVerified) ?? false
+        integrityFailures = try container.decodeIfPresent(Int.self, forKey: .integrityFailures) ?? 0
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encode(size, forKey: .size)
+        try container.encode(completed, forKey: .completed)
+        try container.encode(bytesDownloaded, forKey: .bytesDownloaded)
+        try container.encodeIfPresent(resumeData, forKey: .resumeData)
+        try container.encodeIfPresent(sha256, forKey: .sha256)
+        try container.encode(hashVerified, forKey: .hashVerified)
+        try container.encode(integrityFailures, forKey: .integrityFailures)
+    }
 }
 
 // MARK: - UI snapshot
@@ -176,6 +240,14 @@ struct DownloadSnapshot: Sendable, Equatable {
     /// A partial download exists for this tier and no task is running
     /// (e.g. the last attempt stopped on an error).
     var hasResumableState: Bool = false
+    /// A file the repair scan found corrupt and invalidated, still
+    /// waiting to be re-downloaded (Build 4). The models section
+    /// headlines the active re-download as a repair.
+    var repairFileName: String?
+    /// A validation scan is running (launch / pre-download): header
+    /// checks on every completed safetensors plus one-off SHA-256
+    /// verification of never-verified files (Build 4).
+    var isValidating: Bool = false
 
     /// True when the run stopped on an error (status carries why).
     var isFailed: Bool {
@@ -211,6 +283,22 @@ struct DownloadSnapshot: Sendable, Equatable {
 ///   reason instead of hanging forever.
 /// - truthful UI state via `DownloadSnapshot.status`, and free-space
 ///   reporting in the snapshot while downloading.
+///
+/// Build 4 adds integrity validation, after André's turbo model file
+/// turned out to be corrupt at the right size (damaged during the
+/// disk-full period, then trusted by every size-only check) and
+/// generation died at load with "Invalid json header length":
+/// - every safetensors is structurally validated (header length +
+///   JSON + dtype/shape/data_offsets) when its download lands, and
+///   SHA-256-verified against the HF-published `lfs.sha256` where
+///   one exists, before it may be marked complete; a failed copy is
+///   discarded and the file retried once, then surfaced.
+/// - a repair scan runs before every run (and standalone on launch):
+///   completed files are re-validated — header check always, hash
+///   check for copies never hash-verified — and corrupt ones are
+///   deleted, invalidated and re-downloaded by the normal flow,
+///   storage gate included. `repairFile(tier:fileName:)` is the
+///   manual single-file repair behind the UI's Repair button.
 ///
 /// Concurrency: all mutable state is guarded by `lock`; delegate
 /// callbacks arrive on a serial queue; the UI handlers are @Sendable
@@ -263,6 +351,12 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
     private var watchdogTimer: DispatchSourceTimer?
     private var cachedAvailableCapacity: Int64 = -1
     private var lastCapacityCheckAt = Date.distantPast
+    // Build 4 state
+    /// Files the repair scan invalidated, in scan order; the snapshot
+    /// surfaces the first one still incomplete as the repair target.
+    private var repairFileNames: [String] = []
+    /// A validation scan is in flight (snapshot display only).
+    private var validating = false
 
     private let watchdogQueue = DispatchQueue(label: "com.andrepato.songspike.watchdog")
 
@@ -299,6 +393,10 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
                 self.finishRun(with: .failure(error))
                 return
             }
+            // Build 4: never download on top of a corrupt "complete"
+            // file — validate first; anything the scan invalidates
+            // is simply incomplete for the run that follows.
+            self.validateCompletedFiles(tier: tier)
             self.proceedWithRun(session: session, notify: true)
         }
     }
@@ -333,8 +431,190 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             // idempotent and keeps stored per-file state. Offline is
             // fine — the persisted plan is enough to resume its files.
             try? await self.buildPlan(tier: tier)
+            // Build 4 repair scan, same as start(): a corrupt
+            // "complete" file is invalidated and re-fetched by the
+            // run that follows instead of poisoning generation.
+            self.validateCompletedFiles(tier: tier)
             self.proceedWithRun(session: session, notify: false)
         }
+    }
+
+    /// Launch-time repair scan (Build 4): validates the tier's
+    /// completed files WITHOUT starting a download for files that are
+    /// merely not downloaded yet. Only files the scan itself finds
+    /// corrupt are invalidated — and those it re-downloads through
+    /// the normal run (storage gate included). This is the path that
+    /// repairs André's device: `restore()` early-returns when every
+    /// file is marked complete, corrupt turbo file included, so the
+    /// scan has to run even when there is nothing "incomplete".
+    /// No-op while a run is active — a run validates before it
+    /// proceeds anyway.
+    func repairScan(tier: PlannerTier) {
+        lock.lock()
+        let isRunning = running
+        lock.unlock()
+        guard !isRunning else { return }
+        Task {
+            try? await self.buildPlan(tier: tier)
+            let invalidated = self.validateCompletedFiles(tier: tier)
+            guard !invalidated.isEmpty else {
+                self.emitSnapshot()
+                return
+            }
+            // Re-download only what the scan invalidated, via the
+            // ordinary start path (plan + scan again — now clean —
+            // then the storage gate, then one file at a time).
+            self.start(tier: tier)
+        }
+    }
+
+    /// Manual single-file repair (Build 4): the file behind the UI's
+    /// Repair button after a generation load failure named it. The
+    /// on-disk copy is deleted, its state reset (validation failure
+    /// count included — a manual repair is a fresh attempt), the
+    /// repo's `.complete` marker removed, and a normal run started
+    /// to re-download just that file.
+    func repairFile(tier: PlannerTier, fileName: String) {
+        lock.lock()
+        var repoID: String?
+        if let tierState = persisted.tiers[tier.rawValue] {
+            for repoState in tierState.repos
+            where repoState.files.contains(where: { $0.name == fileName }) {
+                repoID = repoState.repoID
+                break
+            }
+        }
+        lock.unlock()
+        guard let repoID else {
+            // Not in the stored plan (shouldn't happen) — a plain
+            // start still re-plans and downloads what's missing.
+            start(tier: tier)
+            return
+        }
+        let repo = BundleRepo(repoID: repoID, approxMegabytes: 0)
+        let directory = ModelBundles.repoDirectory(repo)
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent(fileName))
+        deleteMarker(for: repo)
+        lock.lock()
+        updateFileLocked(tier: tier, repoID: repoID, fileName: fileName) { state in
+            state.completed = false
+            state.bytesDownloaded = 0
+            state.resumeData = nil
+            state.hashVerified = false
+            state.integrityFailures = 0
+        }
+        if !repairFileNames.contains(fileName) {
+            repairFileNames.append(fileName)
+        }
+        persistLocked()
+        lock.unlock()
+        emitSnapshot()
+        start(tier: tier)
+    }
+
+    /// Validates every file the state calls complete for the tier
+    /// (Build 4 repair scan): size truth first, the safetensors
+    /// header check for `*.safetensors`, and SHA-256 for copies that
+    /// carry an expected hash but were never hash-verified. A file
+    /// that fails is deleted and invalidated (returned, in scan
+    /// order) so the normal flow re-downloads only it — unless it
+    /// has already failed validation twice, in which case automatic
+    /// repair stops and the file waits for the manual Repair action
+    /// instead of looping. Synchronous file work; callers run it off
+    /// the main thread (the start/restore/repairScan tasks).
+    @discardableResult
+    private func validateCompletedFiles(tier: PlannerTier) -> [String] {
+        lock.lock()
+        let tierState = persisted.tiers[tier.rawValue]
+        lock.unlock()
+        guard let tierState else { return [] }
+
+        lock.lock()
+        validating = true
+        lock.unlock()
+        emitSnapshot()
+        defer {
+            lock.lock()
+            validating = false
+            lock.unlock()
+            emitSnapshot()
+        }
+
+        var invalidated: [String] = []
+        for repoState in tierState.repos {
+            let repo = BundleRepo(repoID: repoState.repoID, approxMegabytes: 0)
+            let directory = ModelBundles.repoDirectory(repo)
+            var repoInvalidated = false
+            for file in repoState.files where file.completed {
+                let url = directory.appendingPathComponent(file.name)
+                var valid = true
+                // Size truth: missing or wrong-sized is corrupt.
+                if let diskSize = Self.fileSize(at: url) {
+                    if file.size > 0 && diskSize != file.size { valid = false }
+                } else {
+                    valid = false
+                }
+                if valid && file.name.hasSuffix(".safetensors") {
+                    valid = ModelIntegrity.validateSafetensorsHeader(at: url)
+                }
+                if valid, let expected = file.sha256, !file.hashVerified {
+                    valid = ModelIntegrity.sha256Hex(ofFileAt: url) == expected
+                    if valid {
+                        lock.lock()
+                        updateFileLocked(tier: tier, repoID: repoState.repoID, fileName: file.name) { state in
+                            state.hashVerified = true
+                        }
+                        persistLocked()
+                        lock.unlock()
+                    }
+                }
+                guard !valid else { continue }
+
+                if file.integrityFailures >= 2 {
+                    // Automatic repair already failed twice for this
+                    // file; leave the copy in place (generation's
+                    // pre-flight check will name it and offer the
+                    // manual Repair) rather than loop downloads.
+                    lock.lock()
+                    if lastFailureMessage == nil {
+                        lastFailureMessage = "A model file looks corrupted: \(file.name). "
+                            + "It could not be repaired automatically — use Repair to re-download it."
+                    }
+                    lock.unlock()
+                    continue
+                }
+
+                try? FileManager.default.removeItem(at: url)
+                lock.lock()
+                updateFileLocked(tier: tier, repoID: repoState.repoID, fileName: file.name) { state in
+                    state.completed = false
+                    state.bytesDownloaded = 0
+                    state.resumeData = nil
+                    state.hashVerified = false
+                    state.integrityFailures += 1
+                }
+                if !repairFileNames.contains(file.name) {
+                    repairFileNames.append(file.name)
+                }
+                persistLocked()
+                lock.unlock()
+                repoInvalidated = true
+                invalidated.append(file.name)
+            }
+            if repoInvalidated {
+                deleteMarker(for: repo)
+            }
+        }
+        return invalidated
+    }
+
+    /// Removes a repo's `.complete` marker — the counterpart of
+    /// `writeMarkerIfRepoComplete` for when a file is invalidated
+    /// (Build 4): while the marker stands, `isTierReady` keeps
+    /// reporting the bundle ready and `buildPlan` keeps trusting it.
+    private func deleteMarker(for repo: BundleRepo) {
+        try? FileManager.default.removeItem(
+            at: ModelBundles.repoDirectory(repo).appendingPathComponent(".complete"))
     }
 
     /// Stores the handler iOS passes to
@@ -583,6 +863,13 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             var merged: [FileDownloadState] = fetched.map { fresh in
                 if var existing = stored.first(where: { $0.name == fresh.name }) {
                     existing.size = fresh.size
+                    // Build 4: refresh the expected hash from the API
+                    // (Build 2/3 state predates it). A refreshed hash
+                    // does not un-verify a copy — the flag describes
+                    // the on-disk bytes, which did not change.
+                    if let sha = fresh.sha256 {
+                        existing.sha256 = sha
+                    }
                     return existing
                 }
                 return fresh
@@ -649,18 +936,24 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
 
     private struct HFModelInfo: Decodable {
         struct Sibling: Decodable {
+            struct LFS: Decodable {
+                let sha256: String?
+            }
             let rfilename: String
             let size: Int64?
+            let lfs: LFS?
         }
         let siblings: [Sibling]
     }
 
     /// File list WITH byte sizes (`?blobs=true` adds `size` to every
-    /// sibling). Same file set the Build 1 downloader fetched: all
-    /// siblings — turbo: model.safetensors, config.json,
-    /// silence_latent.safetensors; planners + text encoder:
-    /// + tokenizer.json; VAE: model + config; plus each repo's small
-    /// metadata files.
+    /// sibling) and, for LFS files, the expected SHA-256
+    /// (`lfs.sha256` — every safetensors in these repos carries one;
+    /// Build 4 verifies landed copies against it). Same file set the
+    /// Build 1 downloader fetched: all siblings — turbo:
+    /// model.safetensors, config.json, silence_latent.safetensors;
+    /// planners + text encoder: + tokenizer.json; VAE: model +
+    /// config; plus each repo's small metadata files.
     private func fetchFileList(repoID: String) async throws -> [FileDownloadState] {
         guard let url = URL(string: "https://huggingface.co/api/models/\(repoID)?blobs=true") else {
             throw ModelDownloaderError.fileListFailed(repoID: repoID, underlying: "bad URL")
@@ -669,7 +962,9 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             let (data, _) = try await URLSession.shared.data(from: url)
             let info = try JSONDecoder().decode(HFModelInfo.self, from: data)
             return info.siblings.map {
-                FileDownloadState(name: $0.rfilename, size: $0.size ?? -1)
+                var file = FileDownloadState(name: $0.rfilename, size: $0.size ?? -1)
+                file.sha256 = $0.lfs?.sha256
+                return file
             }
         } catch {
             throw ModelDownloaderError.fileListFailed(repoID: repoID, underlying: "\(error)")
@@ -909,12 +1204,72 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             return
         }
 
+        // Integrity validation before anything is called complete
+        // (Build 4): size alone proved nothing — André's turbo file
+        // had the right byte count and a destroyed header. A
+        // safetensors must parse structurally, and any file with an
+        // HF-published SHA-256 must match it. A failed copy is
+        // deleted and the file retried once through the normal flow;
+        // a second failure stops the run with the corrupt-file
+        // error instead of poisoning the bundle.
+        var integrityVerifiedHash = false
+        var integrityValid = true
+        if match.fileName.hasSuffix(".safetensors") {
+            integrityValid = ModelIntegrity.validateSafetensorsHeader(at: destination)
+        }
+        if integrityValid,
+           let expectedSHA = storedSHA256(tier: match.tier, repoID: match.repoID, fileName: match.fileName) {
+            integrityVerifiedHash = ModelIntegrity.sha256Hex(ofFileAt: destination) == expectedSHA
+            integrityValid = integrityVerifiedHash
+        }
+        if !integrityValid {
+            try? FileManager.default.removeItem(at: destination)
+            lock.lock()
+            let isCurrent = running && currentTaskIdentifier == downloadTask.taskIdentifier
+            var failures = 0
+            updateFileLocked(tier: match.tier, repoID: match.repoID, fileName: match.fileName) { state in
+                state.completed = false
+                state.bytesDownloaded = 0
+                state.resumeData = nil
+                state.hashVerified = false
+                state.integrityFailures += 1
+                failures = state.integrityFailures
+            }
+            if !repairFileNames.contains(match.fileName) {
+                repairFileNames.append(match.fileName)
+            }
+            persistLocked()
+            lock.unlock()
+            if isCurrent && failures < 2 {
+                // Retry the file once, fresh, via the normal flow.
+                if let fresh = storedFiles(tier: match.tier, repoID: match.repoID)
+                    .first(where: { $0.name == match.fileName }) {
+                    beginFile(session: session, tier: match.tier, repo: repo, file: fresh)
+                } else {
+                    finishRun(with: .failure(ModelDownloaderError.corruptFile(file: match.fileName)))
+                }
+            } else if isCurrent {
+                finishRun(with: .failure(ModelDownloaderError.corruptFile(file: match.fileName)))
+            } else {
+                lock.lock()
+                if lastFailureMessage == nil {
+                    lastFailureMessage = "The downloaded copy of \(match.fileName) failed its integrity check and was discarded; it will be fetched again on Resume."
+                }
+                lock.unlock()
+                emitSnapshot()
+            }
+            return
+        }
+
         lock.lock()
         let isCurrent = running && currentTaskIdentifier == downloadTask.taskIdentifier
         lastProgressAt = Date()
         updateFileLocked(tier: match.tier, repoID: match.repoID, fileName: match.fileName) { state in
             state.completed = true
             state.resumeData = nil
+            if integrityVerifiedHash {
+                state.hashVerified = true
+            }
             if let landedSize {
                 state.bytesDownloaded = landedSize
                 if state.size <= 0 { state.size = landedSize }
@@ -1087,6 +1442,18 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             .size
     }
 
+    /// Self-locking read of a file's expected SHA-256 (nil when the
+    /// plan carries none — non-LFS file, or state not yet refreshed
+    /// by a Build 4 plan build).
+    private func storedSHA256(tier: PlannerTier, repoID: String, fileName: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return persisted.tiers[tier.rawValue]?
+            .repos.first { $0.repoID == repoID }?
+            .files.first { $0.name == fileName }?
+            .sha256
+    }
+
     private func refreshMarkers(tier: PlannerTier) {
         for repo in ModelBundles.repos(for: tier) {
             writeMarkerIfRepoComplete(tier: tier, repo: repo)
@@ -1135,6 +1502,7 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
         let tierRaw = currentTier?.rawValue ?? persisted.activeTier ?? ""
         snapshot.tierRawValue = tierRaw
         snapshot.isActive = running
+        snapshot.isValidating = validating
         snapshot.availableCapacityBytes = cachedAvailableCapacity
         guard let tierState = persisted.tiers[tierRaw] else {
             snapshot.status = running ? .downloading : .idle
@@ -1192,6 +1560,18 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Se
             if let file = tierState.repos.first(where: { $0.repoID == repoID })?
                 .files.first(where: { $0.name == fileName }), file.size > 0 {
                 snapshot.fileFraction = min(Double(file.bytesDownloaded) / Double(file.size), 1)
+            }
+        }
+
+        // Build 4: the first scan-invalidated file still incomplete
+        // is the repair target the UI headlines.
+        for name in repairFileNames {
+            let stillIncomplete = tierState.repos.contains { repoState in
+                repoState.files.contains { $0.name == name && !$0.completed }
+            }
+            if stillIncomplete {
+                snapshot.repairFileName = name
+                break
             }
         }
         return snapshot

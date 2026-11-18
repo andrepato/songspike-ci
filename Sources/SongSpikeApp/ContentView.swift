@@ -36,7 +36,20 @@ struct ContentView: View {
 
     private var modelsSection: some View {
         Section("Model bundles") {
-            if viewModel.modelsReady {
+            if let corrupt = viewModel.corruptFileName {
+                // Build 4: a corrupt model file is named, with a
+                // one-file repair — never a cryptic load error.
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("A model file looks corrupted: \(corrupt)")
+                        .font(.headline)
+                    Text("Tap Repair to re-download just that file.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Button("Repair") {
+                        viewModel.repairCorruptFile()
+                    }
+                }
+            } else if viewModel.modelsReady {
                 Label("Bundles ready (\(viewModel.tier.rawValue) tier)", systemImage: "checkmark.circle")
             } else if viewModel.showDownloadProgress {
                 downloadProgress
@@ -44,6 +57,11 @@ struct ContentView: View {
                 Button("Download model bundles (≈ 8 GB)") {
                     viewModel.downloadModels()
                 }
+            }
+            if viewModel.downloadSnapshot.isValidating {
+                Text("Verifying model files…")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
             Picker("Planner tier", selection: $viewModel.tier) {
                 ForEach(PlannerTier.allCases) { tier in
@@ -82,6 +100,11 @@ struct ContentView: View {
                     .font(.headline)
             } else if snapshot.status == .complete {
                 Text("Download complete")
+                    .font(.headline)
+            } else if snapshot.status == .downloading, let repairFile = snapshot.repairFileName {
+                // Build 4: a re-download triggered by the repair
+                // scan is headlined as what it is.
+                Text("Repairing: re-downloading \(repairFile)")
                     .font(.headline)
             } else if let repoLabel = snapshot.repoLabel {
                 Text("Downloading: \(repoLabel)")
